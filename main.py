@@ -1,6 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response, PlainTextResponse
+from fastapi.responses import Response, PlainTextResponse, HTMLResponse
 from typing import List
 import io
 import os
@@ -32,6 +32,86 @@ def read_root():
     return {"status": "ok", "message": "사주운세 숏폼 대본 업로드/다운로드 API 작동 중"}
 
 
+@app.get("/upload-page", response_class=HTMLResponse)
+def upload_page():
+    """브라우저에서 바로 파일을 선택/드래그해서 업로드할 수 있는 간단한 페이지"""
+    return """
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>대본 업로드</title>
+<style>
+  body { font-family: sans-serif; max-width: 600px; margin: 60px auto; padding: 0 20px; }
+  #drop { border: 2px dashed #999; border-radius: 12px; padding: 40px; text-align: center; color: #666; cursor: pointer; }
+  #drop.drag { background: #f0f8ff; border-color: #3b82f6; }
+  #fileList { margin-top: 16px; font-size: 14px; }
+  #fileList li { margin: 4px 0; }
+  button { margin-top: 16px; padding: 10px 20px; font-size: 15px; cursor: pointer; }
+  #result { margin-top: 20px; white-space: pre-wrap; background: #f5f5f5; padding: 12px; border-radius: 8px; font-size: 13px; }
+</style>
+</head>
+<body>
+  <h2>운세 대본 txt 파일 업로드</h2>
+  <p>여러 개(예: 20개)의 .txt 파일을 한 번에 선택하거나 드래그해서 올려주세요.</p>
+
+  <div id="drop">여기에 파일을 끌어다 놓거나 클릭해서 선택하세요</div>
+  <input type="file" id="fileInput" accept=".txt" multiple style="display:none">
+
+  <ul id="fileList"></ul>
+  <button id="uploadBtn" disabled>업로드</button>
+  <div id="result"></div>
+
+<script>
+const drop = document.getElementById('drop');
+const fileInput = document.getElementById('fileInput');
+const fileList = document.getElementById('fileList');
+const uploadBtn = document.getElementById('uploadBtn');
+const result = document.getElementById('result');
+let selectedFiles = [];
+
+drop.addEventListener('click', () => fileInput.click());
+drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('drag'); });
+drop.addEventListener('dragleave', () => drop.classList.remove('drag'));
+drop.addEventListener('drop', e => {
+  e.preventDefault();
+  drop.classList.remove('drag');
+  handleFiles(e.dataTransfer.files);
+});
+fileInput.addEventListener('change', () => handleFiles(fileInput.files));
+
+function handleFiles(files) {
+  selectedFiles = Array.from(files);
+  fileList.innerHTML = selectedFiles.map(f => `<li>${f.name}</li>`).join('');
+  uploadBtn.disabled = selectedFiles.length === 0;
+}
+
+uploadBtn.addEventListener('click', async () => {
+  if (selectedFiles.length === 0) return;
+  const formData = new FormData();
+  selectedFiles.forEach(f => formData.append('files', f));
+
+  uploadBtn.disabled = true;
+  uploadBtn.textContent = '업로드 중...';
+  result.textContent = '';
+
+  try {
+    const res = await fetch('/upload-fortune-scripts', { method: 'POST', body: formData });
+    const data = await res.json();
+    result.textContent = JSON.stringify(data, null, 2);
+  } catch (err) {
+    result.textContent = '업로드 실패: ' + err;
+  } finally {
+    uploadBtn.disabled = false;
+    uploadBtn.textContent = '업로드';
+  }
+});
+</script>
+</body>
+</html>
+"""
+
+
 def _safe_filename(filename: str) -> str:
     """경로 조작(../ 등) 방지용 파일명 정제"""
     base = os.path.basename(filename)
@@ -50,7 +130,7 @@ def _extract_video_id(filename: str) -> int:
 # ---------------------------------------------------------------------------
 # [업로드] 20개 개별 txt 파일 업로드
 # ---------------------------------------------------------------------------
-@app.get("/upload-fortune-scripts")
+@app.post("/upload-fortune-scripts")
 async def upload_fortune_scripts(files: List[UploadFile] = File(...)):
     """
     개별 txt 파일 여러 개(예: 20개)를 업로드하면 서버 로컬 폴더에 저장합니다.
