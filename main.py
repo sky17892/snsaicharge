@@ -98,7 +98,7 @@ def read_root():
 # [생성 시작] 백그라운드로 AI 대본 생성을 시작 (즉시 응답, 타임아웃 없음)
 # 1~5편 = 사용법 안내, 6~20편 = 에피소드·스토리형
 # ---------------------------------------------------------------------------
-@app.post("/generate-fortune-scripts")
+@app.get("/generate-fortune-scripts")
 def generate_fortune_scripts(background_tasks: BackgroundTasks, service_name: str = "사주운세 서비스"):
     """
     AI로 20편(1~5편: 사용법 안내 / 6~20편: 에피소드·스토리형) 대본 생성을 백그라운드로 시작합니다.
