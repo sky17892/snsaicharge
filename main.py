@@ -1,7 +1,10 @@
-from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response, PlainTextResponse
+from fastapi.responses import Response, PlainTextResponse, HTMLResponse
+from typing import List
 import io
+import os
+import re
 import zipfile
 import traceback
 from datetime import datetime, timezone
@@ -10,8 +13,8 @@ from app.schemas import FortuneScriptBatchResponse
 from app.services import generate_fortune_scripts_logic
 
 app = FastAPI(
-    title="Fortune-Telling Short-form Script Generator",
-    description="사주·운세·타로·자미두수 서비스 홍보용 숏폼 대본 20편 자동 생성 API"
+    title="Fortune-Telling Short-form Script Manager",
+    description="사주·운세·타로·자미두수 서비스 홍보용 숏폼 대본 20편 생성/업로드/다운로드 API"
 )
 
 app.add_middleware(
@@ -23,11 +26,13 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------------------------
-# 생성 결과 캐시 + 진행 상태
-# Cloudflare Tunnel(trycloudflare.com)은 기본 100초 타임아웃이 있어서,
-# AI 생성처럼 오래 걸리는 작업을 요청-응답 안에서 바로 끝내면 524 에러가 납니다.
-# 그래서 생성은 백그라운드로 돌리고, 상태는 별도로 폴링하는 구조로 분리했습니다.
-# 서버가 재시작되면 캐시와 상태는 초기화됩니다.
+# 저장 폴더 (배포 전 테스트용 - 로컬 디스크에 파일로만 저장)
+# ---------------------------------------------------------------------------
+STORAGE_DIR = "storage/fortune_scripts"
+os.makedirs(STORAGE_DIR, exist_ok=True)
+
+# ---------------------------------------------------------------------------
+# AI 생성 결과 캐시 + 진행 상태 (POST/GET /generate-fortune-scripts 용)
 # ---------------------------------------------------------------------------
 _CACHE: dict[str, FortuneScriptBatchResponse] = {}
 _STATUS: dict[str, dict] = {}
@@ -49,13 +54,11 @@ def _get_status(service_name: str) -> dict:
 
 
 def _run_generation(service_name: str):
-    """백그라운드에서 실제로 AI 대본 생성을 수행하는 함수 (1~5편: 사용법 안내 / 6~20편: 에피소드·스토리형)"""
     status = _get_status(service_name)
     status["state"] = "running"
     status["started_at"] = _now_iso()
     status["finished_at"] = None
     status["error"] = None
-
     try:
         batch_data = generate_fortune_scripts_logic(service_name)
         _CACHE[service_name] = batch_data
@@ -67,66 +70,35 @@ def _run_generation(service_name: str):
         status["error"] = f"{e}\n{traceback.format_exc()}"
 
 
-def get_cached_or_raise(service_name: str) -> FortuneScriptBatchResponse:
-    """
-    캐시에 저장된 생성 결과를 반환합니다.
-    캐시가 없으면 즉시 AI를 호출하지 않고, 먼저 생성을 시작하라는 안내와 함께 에러를 던집니다.
-    (다운로드 요청 안에서 AI를 새로 호출하면 다시 524가 날 수 있기 때문입니다.)
-    """
-    if service_name in _CACHE:
-        return _CACHE[service_name]
-
-    status = _get_status(service_name)
-    if status["state"] == "running":
-        raise HTTPException(
-            status_code=202,
-            detail="대본을 아직 생성 중입니다. GET /generation-status 로 완료 여부를 확인한 뒤 다시 시도해주세요."
-        )
-
-    raise HTTPException(
-        status_code=404,
-        detail="아직 생성된 대본이 없습니다. 먼저 POST /generate-fortune-scripts 를 호출해 생성을 시작해주세요."
-    )
-
-
 @app.get("/")
 def read_root():
-    return {"status": "ok", "message": "사주운세 서비스 숏폼 대본 생성 API 작동 중"}
+    return {"status": "ok", "message": "사주운세 숏폼 대본 생성/업로드/다운로드 API 작동 중"}
 
 
 # ---------------------------------------------------------------------------
-# [생성 시작] 백그라운드로 AI 대본 생성을 시작 (즉시 응답, 타임아웃 없음)
-# 1~5편 = 사용법 안내, 6~20편 = 에피소드·스토리형
+# [AI 생성 시작] 백그라운드로 20편 생성 (GET으로 바로 실행 가능, 즉시 응답)
 # ---------------------------------------------------------------------------
 @app.get("/generate-fortune-scripts")
 def generate_fortune_scripts(background_tasks: BackgroundTasks, service_name: str = "사주운세 서비스"):
     """
     AI로 20편(1~5편: 사용법 안내 / 6~20편: 에피소드·스토리형) 대본 생성을 백그라운드로 시작합니다.
-    이 요청은 생성이 끝날 때까지 기다리지 않고 즉시 응답하므로 Cloudflare 타임아웃(524)이 발생하지 않습니다.
-    생성 완료 여부는 GET /generation-status 로 확인하세요.
-    이미 생성 중이면 중복 실행하지 않고 현재 상태를 안내합니다.
+    브라우저 주소창에 그냥 쳐도 실행됩니다. 완료 여부는 /generation-status 로 확인하세요.
     """
     status = _get_status(service_name)
-
     if status["state"] == "running":
         return {
             "status": "already_running",
-            "message": "이미 생성이 진행 중입니다. GET /generation-status 로 확인해주세요.",
+            "message": "이미 생성이 진행 중입니다. /generation-status 로 확인해주세요.",
             "started_at": status["started_at"],
         }
-
     background_tasks.add_task(_run_generation, service_name)
-
     return {
         "status": "started",
-        "message": "대본 생성을 백그라운드에서 시작했습니다. GET /generation-status 로 완료 여부를 확인해주세요.",
+        "message": "대본 생성을 백그라운드에서 시작했습니다. /generation-status 로 완료 여부를 확인해주세요.",
         "service_name": service_name,
     }
 
 
-# ---------------------------------------------------------------------------
-# [상태 확인] 생성이 끝났는지 폴링으로 확인
-# ---------------------------------------------------------------------------
 @app.get("/generation-status")
 def generation_status(service_name: str = "사주운세 서비스"):
     status = _get_status(service_name)
@@ -136,143 +108,285 @@ def generation_status(service_name: str = "사주운세 서비스"):
         "started_at": status["started_at"],
         "finished_at": status["finished_at"],
     }
-
     if status["state"] == "error":
         result["error"] = status["error"]
-
     if status["state"] == "done" and service_name in _CACHE:
         batch_data = _CACHE[service_name]
         result["total_count"] = batch_data.total_count
         result["how_to_use_count"] = batch_data.how_to_use_count
         result["episode_count"] = batch_data.episode_count
-
     return result
 
 
-def build_single_script_text(script) -> str:
-    """영상 1편을 Vrew에 바로 붙여넣기 좋은 형태로 변환 (대사만)"""
-    text = f"{script.hook}\n"
-    text += f"{script.body_narration}\n"
-    text += f"{script.closing_line}\n"
-    return text
+# ---------------------------------------------------------------------------
+# [생성된 대본을 저장 폴더로 내보내기] AI 생성 결과를 개별 txt 파일로 저장
+# 이후 업로드 없이도 아래 다운로드 엔드포인트들이 이 파일들을 바로 사용할 수 있음
+# ---------------------------------------------------------------------------
+@app.get("/save-generated-scripts-to-storage")
+def save_generated_scripts_to_storage(service_name: str = "사주운세 서비스"):
+    """
+    캐시에 생성된 대본이 있으면, 각 편을 개별 txt 파일로 STORAGE_DIR에 저장합니다.
+    파일명 형식: 01_사용법_안내_회원가입_및_서비스_소개.txt 등
+    저장 후에는 /fortune-scripts, /download-fortune-vrew-zip 등에서 그대로 사용할 수 있습니다.
+    """
+    status = _get_status(service_name)
+    if service_name not in _CACHE:
+        if status["state"] == "running":
+            raise HTTPException(status_code=202, detail="아직 생성 중입니다. /generation-status 로 확인 후 다시 시도해주세요.")
+        raise HTTPException(status_code=404, detail="생성된 대본이 없습니다. 먼저 /generate-fortune-scripts 를 호출해주세요.")
+
+    batch_data = _CACHE[service_name]
+    saved = []
+    for s in batch_data.scripts:
+        text = f"{s.hook}\n{s.body_narration}\n{s.closing_line}\n"
+        safe_topic = _safe_filename(s.topic)
+        filename = f"{s.video_id:02d}_{_safe_filename(s.content_type)}_{safe_topic}.txt"
+        path = os.path.join(STORAGE_DIR, filename)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        saved.append(filename)
+
+    return {"status": "ok", "saved_count": len(saved), "saved_files": saved}
 
 
-def build_single_script_review_text(script) -> str:
-    """영상 1편을 검수용으로 변환 (모든 메타정보 포함)"""
-    series_info = ""
-    if script.series_group:
-        series_info = f"시리즈: {script.series_group} ({script.episode_order})\n"
+@app.get("/upload-page", response_class=HTMLResponse)
+def upload_page():
+    """브라우저에서 바로 파일을 선택/드래그해서 업로드할 수 있는 간단한 페이지"""
+    return """
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>대본 업로드</title>
+<style>
+  body { font-family: sans-serif; max-width: 600px; margin: 60px auto; padding: 0 20px; }
+  #drop { border: 2px dashed #999; border-radius: 12px; padding: 40px; text-align: center; color: #666; cursor: pointer; }
+  #drop.drag { background: #f0f8ff; border-color: #3b82f6; }
+  #fileList { margin-top: 16px; font-size: 14px; }
+  #fileList li { margin: 4px 0; }
+  button { margin-top: 16px; padding: 10px 20px; font-size: 15px; cursor: pointer; }
+  #result { margin-top: 20px; white-space: pre-wrap; background: #f5f5f5; padding: 12px; border-radius: 8px; font-size: 13px; }
+</style>
+</head>
+<body>
+  <h2>운세 대본 txt 파일 업로드</h2>
+  <p>여러 개(예: 20개)의 .txt 파일을 한 번에 선택하거나 드래그해서 올려주세요.</p>
 
-    app_ref_info = ""
-    if script.app_screen_reference:
-        app_ref_info = f"📱 [앱 화면 흐름]: {script.app_screen_reference}\n"
+  <div id="drop">여기에 파일을 끌어다 놓거나 클릭해서 선택하세요</div>
+  <input type="file" id="fileInput" accept=".txt" multiple style="display:none">
 
-    text = f"[영상 {script.video_id:02d}편 : {script.content_type} / {script.topic}]\n"
-    text += f"제목: {script.title}\n"
-    text += f"등장인물 ID: {script.character_id}\n"
-    text += f"페르소나: {script.persona}\n"
-    text += series_info
-    text += f"예상 길이: {script.estimated_duration} | 비율: {script.aspect_ratio}\n\n"
-    text += f"[대사]\n{script.hook}\n{script.body_narration}\n{script.closing_line}\n\n"
-    text += f"📌 [화면 가이드]: {script.screen_guide}\n"
-    text += app_ref_info
-    text += f"⚠️ [정보성 문구]: {script.disclaimer_note}\n"
-    text += f"🎵 [음원 라이선스]: {script.music_license_note}\n"
-    return text
+  <ul id="fileList"></ul>
+  <button id="uploadBtn" disabled>업로드</button>
+  <div id="result"></div>
+
+<script>
+const drop = document.getElementById('drop');
+const fileInput = document.getElementById('fileInput');
+const fileList = document.getElementById('fileList');
+const uploadBtn = document.getElementById('uploadBtn');
+const result = document.getElementById('result');
+let selectedFiles = [];
+
+drop.addEventListener('click', () => fileInput.click());
+drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('drag'); });
+drop.addEventListener('dragleave', () => drop.classList.remove('drag'));
+drop.addEventListener('drop', e => {
+  e.preventDefault();
+  drop.classList.remove('drag');
+  handleFiles(e.dataTransfer.files);
+});
+fileInput.addEventListener('change', () => handleFiles(fileInput.files));
+
+function handleFiles(files) {
+  selectedFiles = Array.from(files);
+  fileList.innerHTML = selectedFiles.map(f => `<li>${f.name}</li>`).join('');
+  uploadBtn.disabled = selectedFiles.length === 0;
+}
+
+uploadBtn.addEventListener('click', async () => {
+  if (selectedFiles.length === 0) return;
+  const formData = new FormData();
+  selectedFiles.forEach(f => formData.append('files', f));
+
+  uploadBtn.disabled = true;
+  uploadBtn.textContent = '업로드 중...';
+  result.textContent = '';
+
+  try {
+    const res = await fetch('/upload-fortune-scripts', { method: 'POST', body: formData });
+    const data = await res.json();
+    result.textContent = JSON.stringify(data, null, 2);
+  } catch (err) {
+    result.textContent = '업로드 실패: ' + err;
+  } finally {
+    uploadBtn.disabled = false;
+    uploadBtn.textContent = '업로드';
+  }
+});
+</script>
+</body>
+</html>
+"""
 
 
-def build_full_text(service_name: str, scripts) -> str:
-    how_to_use = [s for s in scripts if s.content_type == "사용법 안내"]
-    episodes = [s for s in scripts if s.content_type == "에피소드·스토리형"]
+def _safe_filename(filename: str) -> str:
+    """경로 조작(../ 등) 방지용 파일명 정제"""
+    base = os.path.basename(filename)
+    base = re.sub(r'[\\/:*?"<>|]', "_", base)
+    return base
 
-    text = f"=== [{service_name}] 숏폼 {len(scripts)}편 대본 (검수용) ===\n"
-    text += f"구성: 사용법 안내 {len(how_to_use)}편(1~5편) + 에피소드·스토리형 {len(episodes)}편(6~20편)\n\n"
 
-    for s in scripts:
-        text += build_single_script_review_text(s)
-        text += "=" * 50 + "\n\n"
-    return text
+def _extract_video_id(filename: str) -> int:
+    """파일명에서 앞쪽 숫자를 video_id로 추출 (예: 01_사랑운.txt -> 1)"""
+    match = re.match(r"^0*(\d+)", filename)
+    if match:
+        return int(match.group(1))
+    return -1
 
 
 # ---------------------------------------------------------------------------
-# 전체 텍스트 화면 출력 (검수용, 모든 메타정보 포함) - 캐시된 결과만 사용
+# [업로드] 20개 개별 txt 파일 업로드 (직접 만든 대본을 올릴 때)
+# ---------------------------------------------------------------------------
+@app.post("/upload-fortune-scripts")
+async def upload_fortune_scripts(files: List[UploadFile] = File(...)):
+    """
+    개별 txt 파일 여러 개(예: 20개)를 업로드하면 서버 로컬 폴더에 저장합니다.
+    파일명 앞부분 숫자를 video_id로 인식합니다. (예: 01_연애운.txt, 02_금전운.txt ...)
+    같은 이름의 파일이 이미 있으면 덮어씁니다.
+    """
+    if not files:
+        raise HTTPException(status_code=400, detail="업로드할 파일이 없습니다.")
+
+    saved = []
+    skipped = []
+
+    for f in files:
+        if not f.filename or not f.filename.lower().endswith(".txt"):
+            skipped.append(f.filename or "(이름 없음)")
+            continue
+
+        safe_name = _safe_filename(f.filename)
+        content = await f.read()
+
+        save_path = os.path.join(STORAGE_DIR, safe_name)
+        with open(save_path, "wb") as out:
+            out.write(content)
+
+        saved.append({
+            "filename": safe_name,
+            "video_id": _extract_video_id(safe_name),
+            "size_bytes": len(content),
+        })
+
+    return {
+        "status": "ok",
+        "saved_count": len(saved),
+        "saved_files": sorted(saved, key=lambda x: x["video_id"]),
+        "skipped_files": skipped,
+    }
+
+
+# ---------------------------------------------------------------------------
+# [목록 조회] 현재 저장된 파일 목록 확인
+# ---------------------------------------------------------------------------
+@app.get("/fortune-scripts")
+def list_fortune_scripts():
+    files = sorted(os.listdir(STORAGE_DIR))
+    result = [
+        {"filename": name, "video_id": _extract_video_id(name)}
+        for name in files if name.lower().endswith(".txt")
+    ]
+    result.sort(key=lambda x: x["video_id"])
+    return {"count": len(result), "files": result}
+
+
+# ---------------------------------------------------------------------------
+# 전체 텍스트 화면 출력 (저장된 파일들을 순서대로 합쳐서 보여줌)
 # ---------------------------------------------------------------------------
 @app.get("/export-fortune-vrew-text", response_class=PlainTextResponse)
-def export_fortune_vrew_text(service_name: str = "사주운세 서비스"):
-    batch_data = get_cached_or_raise(service_name)
-    return build_full_text(service_name, batch_data.scripts)
+def export_fortune_vrew_text():
+    files = sorted(
+        [f for f in os.listdir(STORAGE_DIR) if f.lower().endswith(".txt")],
+        key=_extract_video_id,
+    )
+    if not files:
+        raise HTTPException(status_code=404, detail="저장된 대본 파일이 없습니다. 먼저 업로드하거나 AI로 생성해주세요.")
+
+    full_text = "=== 사주운세 숏폼 대본 모음 (Vrew용) ===\n\n"
+    for name in files:
+        path = os.path.join(STORAGE_DIR, name)
+        with open(path, "r", encoding="utf-8") as fp:
+            content = fp.read()
+        full_text += f"--- [{name}] ---\n{content}\n\n" + ("=" * 50) + "\n\n"
+
+    return full_text
 
 
 # ---------------------------------------------------------------------------
-# 전체 20편 통짜 텍스트 파일 다운로드 (검수용, 모든 메타정보 포함)
+# 전체 통짜 텍스트 파일 다운로드
 # ---------------------------------------------------------------------------
 @app.get("/download-fortune-vrew-file")
-def download_fortune_vrew_file(service_name: str = "사주운세 서비스"):
-    batch_data = get_cached_or_raise(service_name)
-    text = build_full_text(service_name, batch_data.scripts)
+def download_fortune_vrew_file():
+    files = sorted(
+        [f for f in os.listdir(STORAGE_DIR) if f.lower().endswith(".txt")],
+        key=_extract_video_id,
+    )
+    if not files:
+        raise HTTPException(status_code=404, detail="저장된 대본 파일이 없습니다. 먼저 업로드하거나 AI로 생성해주세요.")
+
+    full_text = ""
+    for name in files:
+        path = os.path.join(STORAGE_DIR, name)
+        with open(path, "r", encoding="utf-8") as fp:
+            full_text += fp.read() + "\n\n"
 
     headers = {
-        'Content-Disposition': 'attachment; filename="fortune_scripts_review.txt"'
+        'Content-Disposition': 'attachment; filename="fortune_scripts.txt"'
     }
-    return Response(content=text, media_type="text/plain; charset=utf-8", headers=headers)
+    return Response(content=full_text, media_type="text/plain; charset=utf-8", headers=headers)
 
 
 # ---------------------------------------------------------------------------
-# 영상 1편씩 개별 다운로드 (Vrew 붙여넣기용: 대사만)
+# 영상 1편씩 개별 다운로드
 # ---------------------------------------------------------------------------
 @app.get("/download-fortune-vrew-file/{video_id}")
-def download_single_script(video_id: int, service_name: str = "사주운세 서비스"):
-    batch_data = get_cached_or_raise(service_name)
+def download_single_script(video_id: int):
+    files = [f for f in os.listdir(STORAGE_DIR) if f.lower().endswith(".txt")]
+    target = next((f for f in files if _extract_video_id(f) == video_id), None)
 
-    target_script = next((s for s in batch_data.scripts if s.video_id == video_id), None)
-    if not target_script:
-        raise HTTPException(status_code=404, detail=f"video_id {video_id}를 찾을 수 없습니다.")
+    if not target:
+        raise HTTPException(status_code=404, detail=f"video_id {video_id}에 해당하는 파일을 찾을 수 없습니다.")
 
-    text = build_single_script_text(target_script)
-    filename = f"fortune_script_{video_id:02d}.txt"
-
-    headers = {
-        'Content-Disposition': f'attachment; filename="{filename}"'
-    }
-    return Response(content=text, media_type="text/plain; charset=utf-8", headers=headers)
-
-
-# ---------------------------------------------------------------------------
-# 특정 영상 1편 검수용 상세 정보 다운로드 (모든 메타정보 포함)
-# ---------------------------------------------------------------------------
-@app.get("/download-fortune-review-file/{video_id}")
-def download_single_script_review(video_id: int, service_name: str = "사주운세 서비스"):
-    batch_data = get_cached_or_raise(service_name)
-
-    target_script = next((s for s in batch_data.scripts if s.video_id == video_id), None)
-    if not target_script:
-        raise HTTPException(status_code=404, detail=f"video_id {video_id}를 찾을 수 없습니다.")
-
-    text = build_single_script_review_text(target_script)
-    filename = f"fortune_script_{video_id:02d}_review.txt"
+    path = os.path.join(STORAGE_DIR, target)
+    with open(path, "rb") as fp:
+        content = fp.read()
 
     headers = {
-        'Content-Disposition': f'attachment; filename="{filename}"'
+        'Content-Disposition': f'attachment; filename="{target}"'
     }
-    return Response(content=text, media_type="text/plain; charset=utf-8", headers=headers)
+    return Response(content=content, media_type="text/plain; charset=utf-8", headers=headers)
 
 
 # ---------------------------------------------------------------------------
-# 20편 전체를 zip으로 한번에 다운로드 (Vrew 붙여넣기용: 대사만)
+# 20편 전체를 zip으로 한번에 다운로드
 # ---------------------------------------------------------------------------
 @app.get("/download-fortune-vrew-zip")
-def download_fortune_vrew_zip(service_name: str = "사주운세 서비스"):
-    batch_data = get_cached_or_raise(service_name)
+def download_fortune_vrew_zip():
+    files = sorted(
+        [f for f in os.listdir(STORAGE_DIR) if f.lower().endswith(".txt")],
+        key=_extract_video_id,
+    )
+    if not files:
+        raise HTTPException(status_code=404, detail="저장된 대본 파일이 없습니다. 먼저 업로드하거나 AI로 생성해주세요.")
 
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-        for s in batch_data.scripts:
-            filename = f"fortune_script_{s.video_id:02d}_{s.content_type}_{s.topic}.txt"
-            content = build_single_script_text(s)
-            zip_file.writestr(filename, content)
+        for name in files:
+            path = os.path.join(STORAGE_DIR, name)
+            with open(path, "rb") as fp:
+                zip_file.writestr(name, fp.read())
 
     zip_buffer.seek(0)
-
     headers = {
         'Content-Disposition': 'attachment; filename="fortune_scripts_all.zip"'
     }
@@ -280,22 +394,11 @@ def download_fortune_vrew_zip(service_name: str = "사주운세 서비스"):
 
 
 # ---------------------------------------------------------------------------
-# 20편 전체 검수용 zip 다운로드 (모든 메타정보 포함, 편별 개별 파일)
+# [삭제] 저장된 대본 전체 초기화 (테스트 중 다시 업로드하고 싶을 때)
 # ---------------------------------------------------------------------------
-@app.get("/download-fortune-review-zip")
-def download_fortune_review_zip(service_name: str = "사주운세 서비스"):
-    batch_data = get_cached_or_raise(service_name)
-
-    zip_buffer = io.BytesIO()
-    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-        for s in batch_data.scripts:
-            filename = f"fortune_script_{s.video_id:02d}_{s.content_type}_{s.topic}_review.txt"
-            content = build_single_script_review_text(s)
-            zip_file.writestr(filename, content)
-
-    zip_buffer.seek(0)
-
-    headers = {
-        'Content-Disposition': 'attachment; filename="fortune_scripts_review_all.zip"'
-    }
-    return Response(content=zip_buffer.read(), media_type="application/zip", headers=headers)
+@app.delete("/fortune-scripts")
+def clear_fortune_scripts():
+    files = [f for f in os.listdir(STORAGE_DIR) if f.lower().endswith(".txt")]
+    for name in files:
+        os.remove(os.path.join(STORAGE_DIR, name))
+    return {"status": "ok", "deleted_count": len(files)}
