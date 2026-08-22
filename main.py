@@ -50,7 +50,7 @@ def _extract_video_id(filename: str) -> int:
 # ---------------------------------------------------------------------------
 # [업로드] 20개 개별 txt 파일 업로드
 # ---------------------------------------------------------------------------
-@app.post("/upload-fortune-scripts")
+@app.get("/upload-fortune-scripts")
 async def upload_fortune_scripts(files: List[UploadFile] = File(...)):
     """
     개별 txt 파일 여러 개(예: 20개)를 업로드하면 서버 로컬 폴더에 저장합니다.
