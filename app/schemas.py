@@ -11,7 +11,7 @@ class FortuneScriptItem(BaseModel):
     body_narration: str = Field(description="본편 내레이션/대사 (정보성 표현 기준 준수)")
     closing_line: str = Field(description="마무리 멘트 (직접적 서비스 강조 지양)")
     screen_guide: str = Field(description="화면 연출 가이드 (배경, 등장인물 동작, 자막 포인트)")
-    estimated_duration: str = Field(description="예상 길이 (예: 20~30초)")
+    estimated_duration: str = Field(description="예상 길이 (예: 10~20초)")
     disclaimer_note: str = Field(description="정보성 콘텐츠임을 알리는 문구 삽입 여부/위치")
 
 class FortuneScriptBatchResponse(BaseModel):
